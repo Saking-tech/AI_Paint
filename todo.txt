@@ -1,0 +1,230 @@
+Next-Gen Paint: Architecture & Development Plan
+Executive Summary
+This document is a complete blueprint for building a cross-platform desktop paint program (“Next-Gen Paint”) that matches MicrosoftPaint’s core workflow while adding pro-level capabilities: layers, masks, adjustment-layers, filters, blur/sharpen, smudge, retouching, and AI-powered object removal.
+The stack combines Python (Qt 6/PySide) for rapid UI iteration with C++17 plug-ins for performance-critical imaging kernels.
+
+1. Product Vision
+Democratize digital art: a free, open-source tool that feels as simple as Paint yet scales to semi-pro needs.
+
+Cross-platform: Windows, macOS, Linux (Wayland/X11).
+
+Modularity: every imaging function is an opt-in C++ plug-in accessed through a stable Python binding layer.
+
+Live-non-destructive workflow: adjustment layers, editable masks, unlimited undo, 16-bit/channel internal pipeline.
+
+2. User Stories
+Draw quickly with familiar tools (brush, line, rectangle, fill, text).
+
+Manage multiple raster layers; reorder, rename, group, set blend modes and opacity.
+
+Add Adjustment Layer → Levels, Curves, Hue/Sat, Color-Lookup, Exposure.
+
+Apply Filter → Gaussian Blur, Unsharp Mask, Emboss, Edge Detect.
+
+Pick Smudge Tool → liquefy colours along stroke with dynamic radius.
+
+Lasso Select → Refine Edge → Feather or add as vector mask.
+
+Click “Remove Object” → AI-inpaint selection.
+
+Export final composition as PSD, PNG-32, or layered OpenRaster (.ora).
+
+3. High-Level Architecture
+Tier	Tech	Responsibility
+UI Shell	Python 3.12 + Qt 6 (PySide)	Windows, menus, docking panes, canvas view, shortcut mapper
+Canvas Core	C++17 dynamic library (libngp_core)
+exposed to Python via pybind11	Tiled surface engine, color management (Little CMS), stroke recorder, undo stack
+Imaging Plug-ins	C++17 shared objects; each exports process(Tile*)	Blur, Sharpen, Unsharp Mask, Smudge, Inpainting, Blend-Modes
+Data Models	Python dataclasses + tiny C structs	Document, Layer, Mask, FilterStack
+Persistence	Python	Load/Save PNG/JPEG, layered ORA, PSD (via psd-tools)
+Scripting	Python	Macro recorder and plug-in host (future)
+4. Detailed Component Design
+4.1 Canvas & Tile Engine
+Fixed 256×256 pixel tiles stored as 16-bit RGBA; tiled mip-pyramid for zoom.
+
+Dirty-rect propagation: redraw only tiles touched by stroke or filter region.
+
+Backing store in shared memory so C++ plug-ins read/write zero-copy.
+
+4.2 Layer & Mask Model
+text
+class Layer:
+    name: str
+    pixels: TileGrid  # pointer to C++ tiles
+    opacity: float    # 0-1
+    blend_mode: BlendMode
+    visible: bool
+    clip_mask: Optional[Layer]   # greyscale mask
+    adjustment_stack: list[Adjustment]  # non-destructive
+Blend modes replicate Photoshop math (Multiply, Screen, Overlay, etc.). 
+
+Layer groups flatten on demand for preview; keep child list for edit.
+
+4.3 Brush & Smudge Engine
+Brush stamp = greyscale mask * colour.
+
+Smudge: two-phase algorithm 
+
+On down → copy patch under cursor into buffer.
+
+On move → alpha-blend buffered pixels onto canvas, then refill buffer from new locus.
+
+Dynamic radius = min(σ,θ) where σ=distance to nearest edge (SmartSmudge). 
+
+4.4 Filters
+Filter	Algorithm	Notes
+Gaussian Blur	Fast separable box-blur approximation	SIMD + OpenMP; adjustable σ
+Unsharp Mask	dst = src + k · (src − blur(src))	k slider; radius slider
+Sharpen	5×High-Pass Laplacian kernel	16-bit clamped
+Non-Local Means Denoise (object removal prepass)	OpenCV fast NLM	
+Inpaint	OpenCV Telea & Navier-Stokes modes	
+Plug-in interface:
+
+cpp
+extern "C" void process(Tile* data, int w, int h,
+                        const FilterParams& p, Progress* cb);
+4.5 Adjustment Layers
+Implemented purely in Python; render shader compiled via NumPy-vectorised operations, executed per-tile on CPU or via compute-shader (Qt RHI) future.
+
+4.6 Selection & Masking
+Marching-ants channel stored as 0-255 mask. 
+
+Quick Mask mode toggles (Shift+Q) overlay.
+
+Feather, Grow/Shrink, Color Range (histogram-based).
+
+4.7 Retouch & Object Removal
+Workflow:
+
+User draws freehand selection.
+
+Core builds mask → dilate 3px.
+
+Pass to Inpaint plug-in (Telea) with radius proportional to selection bbox.
+
+5. Technology Stack & Libraries
+Purpose	Library
+UI & Widgets	Qt 6 / PySide6
+Python ↔ C++ bridge	pybind11
+Image IO & basic ops	OpenCV 4.9 (in plug-in)
+Colour Management	LittleCMS 2.16
+SIMD	xsimd / SSE2-fallback
+Build	CMake 3.28, Conan v2 packages
+Packaging	PyInstaller (Win/macOS), AppImage (Linux)
+6. Development Roadmap
+Phase 0 – Repo & CI (Week 1)
+GitHub repo; clang-format hooks
+
+GitHub Actions: Windows VS2022, Ubuntu 22.04, macOS 14 runners
+
+CMake super-build downloads Qt, pybind11, OpenCV via Conan.
+
+Phase 1 – MVP Paint (Weeks 2-4)
+Python UI skeleton: canvas widget shows QImage.
+
+Layer panel (QTreeView) with add/delete/reorder.
+
+Basic brushes (round soft, hard) & eraser.
+
+File → New/Open/Save (PNG, ORA).
+Deliverable: parity with old MSPaint.
+
+Phase 2 – Effects Engine (Weeks 5-8)
+C++ Gaussian Blur, Unsharp Mask plug-ins.
+
+Filter dialog binding (Python → C++).
+
+Unlimited Undo/Redo (tile diff snapshots).
+
+Preference: 8-bit vs 16-bit working depth.
+
+Phase 3 – Layers & Masks (Weeks 9-11)
+Clip-mask attachment UI, overlay preview.
+
+Blend-mode dropdown (20 modes).
+
+Adjustment-layer stack with live preview (LUT shader).
+
+Phase 4 – Advanced Tools (Weeks 12-15)
+Smudge brush (SmartSmudge algorithm).
+
+Object Removal: Telea inpaint.
+
+Selection: Quick Mask, Feather, Color Range.
+
+Phase 5 – Polish & Release (Weeks 16-18)
+Theming, splash screen, icon set (SVG).
+
+Localisation hooks (Qt Linguist).
+
+Code-sign Windows .msi and macOS .dmg.
+
+7. Key Algorithms (C++ snippets)
+7.1 Fast Gaussian Blur
+cpp
+void fast_gaussian(Tile& t, float sigma)
+{
+  auto passes = boxes_for_gauss(sigma, 3);
+  for (auto r : passes)
+      box_blur(t, r);          // 3× box ≈ gaussian[21]
+}
+7.2 Unsharp Mask
+cpp
+void unsharp(Tile& t, float radius, float amount)
+{
+  Tile tmp = t.clone();
+  fast_gaussian(tmp, radius);
+  t += (t - tmp) * amount;     // clamp handled by Tile::operator+=
+}
+7.3 Smudge Brush (simplified)
+cpp
+struct SmudgeState {
+  std::vector<Pixel> buffer;
+  int size;
+};
+
+void pick_up(const Tile& canvas, SmudgeState& s, Point p)
+{
+  sample_patch(canvas, p, s.size, s.buffer);
+}
+
+void put_down(Tile& canvas, SmudgeState& s, Point p)
+{
+  blend_patch(canvas, p, s.buffer, 0.5f);  // 50 % alpha
+  pick_up(canvas, s, p);                   // refill
+}
+7.4 Inpaint Telea call
+cpp
+cv::Mat dst;
+cv::inpaint(src, mask, dst, radius, cv::INPAINT_TELEA);  // [53]
+8. UI Mock-up Key Panels
+Canvas (infinite checkerboard background).
+
+Tool-bar: Brush, Eraser, Smudge, Blur, Sharpen, Inpaint, ColorPicker.
+
+Properties pane: brush size/opacity/spacing, filter sliders live-update.
+
+Layers & Adjustments stacked left dock.
+
+9. Risk & Mitigation
+Risk	Mitigation
+Performance on 4-K canvas	Tile engine + SIMD; move heavy filters to background thread; future GPU compute via Qt RHI
+Cross-platform packaging	Use Conan-Center & Qt Installer Framework; CI builds per OS
+Memory bloat with undo	Delta-tiled history; auto-purge older states on RAM cap
+Legal (PS blend math)	All formulas derive from open references; GPL-3 or MPL-2 licensing
+10. Next Steps for Development
+Clone template repo with provided CMake + pybind11 scaffolding.
+
+Implement TileGrid C++ class and expose via py::class_.
+
+Build blur.cpp, unsharp.cpp, blend.cpp plug-ins; ensure unit tests (GoogleTest) pass.
+
+In Python, create CanvasWidget subclassing QOpenGLWidget, wire paint events to C++ strokes.
+
+Iterate UI in Qt Designer; hot-reload via PySide.
+
+Sample command to run MVP
+bash
+python -m ngpaint
+Conclusion
+Following this staged plan delivers a modern, extensible paint application within ~18 weeks. Python speeds up feature prototyping, while C++ back-ends guarantee native-level performance for computational imaging tasks. The architecture intentionally mirrors professional tools (Krita, Paint.NET) yet remains approachable for contributors. Happy coding!
